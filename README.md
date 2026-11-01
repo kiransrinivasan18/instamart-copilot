@@ -73,7 +73,7 @@ Orders, in this order (counts are measured on the data as it stands when each ru
 Result: 12,309 orders (11,110 completed, 1,199 cancelled, 0 pending). Revenue of completed orders is INR 2,998,668.80.
 
 ### Storage and validation
-Clean tables are written to `data/clean/*.csv` and to `data/instamart.db` (tables `customers`, `products`, `orders`; `order_ts` stored as `YYYY-MM-DD HH:MM:SS`). `validate.py` asserts 18 checkpoints (row and status counts, uniqueness of `order_id`, missing-value counts, revenue, city and gender counts, age range, DB tables and DB totals) and prints `ALL CHECKPOINTS PASSED`.
+Clean tables are written to `data/clean/*.csv` and to `data/instamart.db` (tables `customers`, `products`, `orders`; `order_ts` stored as `YYYY-MM-DD HH:MM:SS`). `validate.py` asserts 16 checkpoints (row and status counts, uniqueness of `order_id`, missing-value counts, revenue, city and gender counts, age range, DB tables and DB totals) and prints `ALL CHECKPOINTS PASSED`.
 
 ### SQL analysis (`sql/queries.sql`, run by `run_sql.py`, which reads the file)
 | Query | Result |
