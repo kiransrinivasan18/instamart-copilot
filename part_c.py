@@ -1,225 +1,201 @@
-import pandas as pd
-import re
+"""Part C: support-ticket triage with guardrails, retries, validation, budget and routing."""
 import json
-import time
-import random
 import os
+import random
+import re
+import time
+
+import pandas as pd
+
 import mock_llm
 
-os.makedirs('outputs', exist_ok=True)
-os.makedirs('state', exist_ok=True)
+os.makedirs("outputs", exist_ok=True)
 
-print("--- 1 & 2. INPUT GUARDRAILS & REDACTION ---")
-tickets = pd.read_csv('data/raw/tickets.csv', keep_default_na=False)
+MAX_INPUT_TOKENS = 400
+BASE_DELAY = 0.05
+MAX_RETRIES = 3
+ALLOWED = {"billing", "delivery", "technical", "fraud"}
 
-email_re = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
-phone_re = re.compile(r"\b[6-9]\d{9}\b")
-order_re = re.compile(r"ORD-\d{6}")
+# ------------------------------------------------------------------ 1-2. GUARDRAILS + REDACTION
+print("--- 1 & 2. INPUT GUARDRAILS AND REDACTION ---")
+tickets = pd.read_csv("data/raw/tickets.csv", keep_default_na=False)
+PATTERNS = [("email", re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "[EMAIL]"),
+            ("phone", re.compile(r"\b[6-9]\d{9}\b"), "[PHONE]"),
+            ("order_id", re.compile(r"ORD-\d{6}"), "[ORDER_ID]")]
 
-redact_counts = {'email': 0, 'phone': 0, 'order': 0}
-clean_texts = []
-statuses = []
 
-for idx, row in tickets.iterrows():
-    text = row['text']
-    # Guardrail: Empty
+def redact(text, counts):
+    for name, pat, placeholder in PATTERNS:
+        counts[name] += len(pat.findall(text))
+        text = pat.sub(placeholder, text)
+    return text
+
+
+counts = {n: 0 for n, _, _ in PATTERNS}
+clean_texts, base_status = [], []
+for text in tickets["text"]:
+    redacted = redact(text, counts)          # redaction applied to all 164 tickets
+    clean_texts.append(redacted)
     if not text.strip():
-        clean_texts.append("")
-        statuses.append("skipped_empty")
-        continue
-        
-    # Guardrail: Too Long
-    if mock_llm.est_tokens(text) > 400:
-        clean_texts.append(text)
-        statuses.append("flagged_long")
-        continue
-        
-    # Redact Privacy Data
-    e_subs = len(email_re.findall(text))
-    text = email_re.sub("[EMAIL]", text)
-    
-    p_subs = len(phone_re.findall(text))
-    text = phone_re.sub("[PHONE]", text)
-    
-    o_subs = len(order_re.findall(text))
-    text = order_re.sub("[ORDER_ID]", text)
-    
-    redact_counts['email'] += e_subs
-    redact_counts['phone'] += p_subs
-    redact_counts['order'] += o_subs
-    
-    clean_texts.append(text)
-    statuses.append("pending")
+        base_status.append("skipped_empty")
+    elif mock_llm.est_tokens(text) > MAX_INPUT_TOKENS:
+        base_status.append("flagged_long")
+    else:
+        base_status.append("pending")
+tickets["clean_text"], tickets["base_status"] = clean_texts, base_status
 
-tickets['clean_text'] = clean_texts
-tickets['base_status'] = statuses
+print(f"skipped_empty: {base_status.count('skipped_empty')}, flagged_long: {base_status.count('flagged_long')}, "
+      f"eligible: {base_status.count('pending')}")
+print(f"redactions: emails {counts['email']}, phones {counts['phone']}, order ids {counts['order_id']}, "
+      f"total {sum(counts.values())}")
+left = sum(len(p.findall(t)) for t in clean_texts for _, p, _ in PATTERNS)
+assert left == 0, "personal data left after redaction"
+print(f"patterns re-applied to redacted texts find: {left}")
 
-print(f"Redactions - Emails: {redact_counts['email']}, Phones: {redact_counts['phone']}, Orders: {redact_counts['order']}")
-print(f"Total Redactions: {sum(redact_counts.values())}")
-
-# Verify no leaks
-leftover = sum(1 for t in clean_texts if email_re.search(t) or phone_re.search(t) or order_re.search(t))
-assert leftover == 0, "Privacy leak detected! Guardrails failed."
-
-print("\n--- 3, 4, 5. PROMPTS, RETRY & VALIDATION ---")
-ZERO_SHOT = """CLASSIFY the customer support ticket into one of these categories: billing, delivery, technical, fraud.
-Reply ONLY in JSON format: {"category": "...", "reason": "..."}"""
-
+# ------------------------------------------------------------------ 3. PROMPTS
+ZERO_SHOT = """CLASSIFY the customer support ticket into exactly one of these categories: billing, delivery, technical, fraud.
+Reply with JSON only, in the form {"category": "...", "reason": "..."}"""
 FEW_SHOT = ZERO_SHOT + """
 
 EXAMPLES:
 Ticket: "Someone hacked my account and used my wallet balance."
 {"category": "fraud", "reason": "unauthorized access and stolen balance"}
-
-Ticket: "Delivery for [ORDER_ID] is very late."
+Ticket: "My delivery for [ORDER_ID] is very late."
 {"category": "delivery", "reason": "complaint about delayed arrival"}
 """
+assert "CLASSIFY" in ZERO_SHOT and "EXAMPLES:" not in ZERO_SHOT
+assert "CLASSIFY" in FEW_SHOT and "EXAMPLES:" in FEW_SHOT
 
+
+# ------------------------------------------------------------------ 5. VALIDATION
 def validate_output(text):
-    allowed = {"billing", "delivery", "technical", "fraud"}
     try:
         data = json.loads(text)
-        if isinstance(data, dict) and data.get("category") in allowed:
+        if isinstance(data, dict) and data.get("category") in ALLOWED:
             return data["category"], "classified_json"
-    except:
+    except (json.JSONDecodeError, TypeError):
         pass
-        
-    # Fallback keyword extraction if JSON fails
     words = re.findall(r"[a-z]+", text.lower())
-    found = [w for w in allowed if w in words]
+    found = [c for c in ALLOWED if c in words]
     if len(found) == 1:
         return found[0], "classified_keyword"
-        
     return None, "flagged_invalid_output"
 
-def run_pipeline(prompt_sys, budget_limit, is_final=False):
-    mock_llm.reset() # Reset transient error counter
-    budget = {'used': 0, 'limit': budget_limit}
-    results = []
-    BASE_DELAY = 0.05
-    
-    for idx, row in tickets.iterrows():
-        tid = row['ticket_id']
-        status = row['base_status']
-        
-        if status != "pending":
+
+retry_file = open("outputs/retry_log.txt", "w", encoding="utf-8")
+
+
+# ------------------------------------------------------------------ 4. RESILIENT PIPELINE
+def run_pipeline(label, system_prompt, token_budget, show_retries=False):
+    """One full run. Every retry gets one log line (written to outputs/retry_log.txt, and printed if show_retries)."""
+    mock_llm.reset()
+    used, results = 0, []
+    stats = {"transient": 0, "recovered": 0, "calls_for_ineligible": 0}
+    for _, row in tickets.iterrows():
+        tid, status = row["ticket_id"], row["base_status"]
+        if status != "pending":                       # guardrail: never sent to the model
             results.append((tid, status, None, 0))
             continue
-            
-        messages = [
-            {"role": "system", "content": prompt_sys},
-            {"role": "user", "content": row['clean_text']}
-        ]
-        
-        final_status = "flagged_invalid_output"
-        final_cat = None
-        tokens = 0
-        
-        # Max 1 attempt + 3 retries = 4 loops
-        for attempt in range(4):
-            if budget['used'] >= budget['limit']:
+        messages = [{"role": "system", "content": system_prompt},
+                    {"role": "user", "content": row["clean_text"]}]
+        # privacy assertion on the exact payload that is sent
+        sent = messages[-1]["content"]
+        assert sent == row["clean_text"]
+        assert not any(p.search(sent) for _, p, _ in PATTERNS), "personal data in a prompt"
+
+        final_status, cat, tokens, had_error = "flagged_invalid_output", None, 0, False
+        for attempt in range(MAX_RETRIES + 1):
+            if used >= token_budget:                  # budget check before every call
                 final_status = "budget_exhausted"
                 break
-                
             try:
                 res = mock_llm.chat(messages)
                 tokens = res.usage.total_tokens
-                budget['used'] += tokens
-                
-                cat, val_status = validate_output(res.choices[0].message.content)
-                final_status = val_status
-                final_cat = cat
-                break # Success, exit retry loop
-                
+                used += tokens
+                cat, final_status = validate_output(res.choices[0].message.content)
+                if had_error:
+                    stats["recovered"] += 1
+                break
             except mock_llm.TransientLLMError:
-                if attempt < 3: # Can retry 3 times
-                    wait = BASE_DELAY * (2**attempt) * random.uniform(0.9, 1.15)
-                    # Log retry only on final full run to keep terminal clean
-                    if is_final:
-                        print(f"Retry Log - Ticket {tid}: Retry {attempt}, wait {wait:.4f}s")
-                    time.sleep(wait)
-                else:
-                    raise
-        
-        results.append((tid, final_status, final_cat, tokens))
-        
-    return results
+                stats["transient"] += 1
+                had_error = True
+                if attempt == MAX_RETRIES:
+                    final_status = "flagged_invalid_output"      # permanent failure -> human, never guess
+                    break
+                wait = BASE_DELAY * 2 ** attempt * random.uniform(0.9, 1.15)
+                line = f"[{label}] ticket {tid}: retry {attempt}, wait {wait:.4f}s"
+                retry_file.write(line + "\n")
+                if show_retries:
+                    print(line)
+                time.sleep(wait)
+        results.append((tid, final_status, cat, tokens))
+    return results, stats, used
 
-print("\nRunning Zero-Shot (No Limit)...")
-zs_res = run_pipeline(ZERO_SHOT, 999999)
-print("Running Few-Shot (No Limit)...")
-fs_res = run_pipeline(FEW_SHOT, 999999)
 
-# 6. Evaluate and Compare
-def evaluate(res_list):
-    df_res = pd.DataFrame(res_list, columns=['ticket_id', 'status', 'pred_cat', 'tokens'])
-    df_eval = tickets.merge(df_res, on='ticket_id')
-    classified = df_eval[df_eval['status'].isin(['classified_json', 'classified_keyword'])]
-    
-    acc = (classified['pred_cat'] == classified['true_category']).mean() if not classified.empty else 0
-    json_cnt = (df_eval['status'] == 'classified_json').sum()
-    kw_cnt = (df_eval['status'] == 'classified_keyword').sum()
-    inv_cnt = (df_eval['status'] == 'flagged_invalid_output').sum()
-    
-    return len(classified), acc, df_res['tokens'].sum(), json_cnt, kw_cnt, inv_cnt, df_eval
+def evaluate(results):
+    res = pd.DataFrame(results, columns=["ticket_id", "status", "pred_cat", "tokens"])
+    merged = tickets.merge(res, on="ticket_id")
+    ok = merged[merged["status"].isin(["classified_json", "classified_keyword"])]
+    return {"classified": len(ok), "accuracy": (ok["pred_cat"] == ok["true_category"]).mean(),
+            "tokens": int(res["tokens"].sum()), "json": int((merged["status"] == "classified_json").sum()),
+            "keyword": int((merged["status"] == "classified_keyword").sum()),
+            "invalid": int((merged["status"] == "flagged_invalid_output").sum())}, ok
 
-zs_cls, zs_acc, zs_tok, z_j, z_k, z_i, zs_df = evaluate(zs_res)
-fs_cls, fs_acc, fs_tok, f_j, f_k, f_i, fs_df = evaluate(fs_res)
 
-print(f"\nZero-Shot: {zs_cls} classified ({z_j} JSON, {z_k} KW, {z_i} Invalid). Acc: {zs_acc:.1%}. Total Tokens: {zs_tok}, Per classified ticket: {zs_tok/zs_cls:.1f}")
-print(f"Few-Shot:  {fs_cls} classified ({f_j} JSON, {f_k} KW, {f_i} Invalid). Acc: {fs_acc:.1%}. Total Tokens: {fs_tok}, Per classified ticket: {fs_tok/fs_cls:.1f}")
+print("\n--- 3, 4, 5, 6. FULL RUNS (zero-shot vs few-shot) ---")
+zs_res, zs_stats, _ = run_pipeline("zero-shot", ZERO_SHOT, 10 ** 9)
+fs_res, fs_stats, _ = run_pipeline("few-shot", FEW_SHOT, 10 ** 9)
+zs, zs_ok = evaluate(zs_res)
+fs, _ = evaluate(fs_res)
+for name, r, st in [("Zero-shot", zs, zs_stats), ("Few-shot", fs, fs_stats)]:
+    print(f"{name}: classified {r['classified']} ({r['json']} json, {r['keyword']} keyword), invalid {r['invalid']}, "
+          f"accuracy {r['accuracy']:.1%}, tokens {r['tokens']}, per classified ticket {r['tokens'] / r['classified']:.1f}")
+    print(f"   TransientLLMErrors {st['transient']}, recovered by retry {st['recovered']}")
+print("\nZero-shot confusion table (rows = true, columns = predicted):")
+print(pd.crosstab(zs_ok["true_category"], zs_ok["pred_cat"]).to_string())
+print(f"extra few-shot cost: {(fs['tokens'] / fs['classified']) - (zs['tokens'] / zs['classified']):.1f} tokens per classified ticket")
 
-print("\nZero-Shot Confusion Matrix:")
-zs_classified = zs_df[zs_df['status'].isin(['classified_json', 'classified_keyword'])]
-print(pd.crosstab(zs_classified['true_category'], zs_classified['pred_cat']))
+# ------------------------------------------------------------------ 7. BUDGET DEMO + ROUTING
+print("\n--- 7. BUDGET DEMO AND FINAL ROUTING ---")
+demo_res, demo_stats, demo_used = run_pipeline("budget-demo", ZERO_SHOT, 6000)
+demo = pd.DataFrame(demo_res, columns=["ticket_id", "status", "category", "tokens_used"])
+demo.to_csv("outputs/triage_budget_demo.csv", index=False)
+n_ex = int((demo["status"] == "budget_exhausted").sum())
+assert n_ex >= 1
+print(f"budget demo (TOKEN_BUDGET = 6000): {n_ex} tickets ended budget_exhausted; tokens used {demo_used}")
 
-# 7. Budget Demo & Final Routing
-print("\n--- 7. BUDGET DEMO & FINAL ROUTING ---")
-budget_demo = run_pipeline(ZERO_SHOT, 6000)
-demo_df = pd.DataFrame(budget_demo, columns=['ticket_id', 'status', 'category', 'tokens'])
-demo_df.to_csv('outputs/triage_budget_demo.csv', index=False)
-exhausted = (demo_df['status'] == 'budget_exhausted').sum()
-print(f"Budget Demo (6000 tokens): {exhausted} tickets ended as 'budget_exhausted'.")
+final_res, final_stats, _ = run_pipeline("final-few-shot", FEW_SHOT, 100000, show_retries=True)
+retry_file.close()
+print(f"final run: {final_stats['transient']} TransientLLMErrors, {final_stats['recovered']} recovered")
+final = pd.DataFrame(final_res, columns=["ticket_id", "status", "category", "tokens_used"])
 
-print("\nGenerating Final Triage Results with Few-Shot (Limit 100,000 tokens)...")
-final_res = run_pipeline(FEW_SHOT, 100000, is_final=True)
-final_df = pd.DataFrame(final_res, columns=['ticket_id', 'status', 'category', 'tokens_used'])
+segments = pd.read_csv("outputs/customer_segments.csv")[["customer_id", "segment_name", "is_premium"]]
+final = tickets[["ticket_id", "customer_id"]].merge(final, on="ticket_id").merge(segments, on="customer_id", how="left")
+final["is_premium"] = final["is_premium"].fillna(False).astype(bool)
 
-# Read segments from Part B for routing logic
-segments = pd.read_csv('outputs/customer_segments.csv')[['customer_id', 'segment_name', 'is_premium']]
+HUMAN = {"skipped_empty", "flagged_long", "flagged_invalid_output", "budget_exhausted"}
 
-final_df = tickets[['ticket_id', 'customer_id']].merge(final_df, on='ticket_id')
-final_df = final_df.merge(segments, on='customer_id', how='left')
-final_df['is_premium'] = final_df['is_premium'].fillna(False)
 
-routes = []
-priorities = []
+def route(r):
+    if r["status"] in HUMAN:
+        return "human_review", "NORMAL"
+    if r["category"] == "fraud":
+        return "security_team", "HIGH"
+    if r["is_premium"]:
+        return "premium_desk", "HIGH"
+    return "support_queue", "NORMAL"
 
-for idx, row in final_df.iterrows():
-    s = row['status']
-    c = row['category']
-    p = row['is_premium']
-    
-    if s in ['skipped_empty', 'flagged_long', 'flagged_invalid_output', 'budget_exhausted']:
-        routes.append('human_review')
-        priorities.append('NORMAL')
-    elif c == 'fraud':
-        routes.append('security_team')
-        priorities.append('HIGH')
-    elif p:
-        routes.append('premium_desk')
-        priorities.append('HIGH')
-    else:
-        routes.append('support_queue')
-        priorities.append('NORMAL')
-        
-final_df['route'] = routes
-final_df['priority'] = priorities
 
-final_df.loc[final_df['category'].isna(), 'category'] = ""
-final_df.loc[final_df['segment_name'].isna(), 'segment_name'] = ""
+final[["route", "priority"]] = final.apply(lambda r: pd.Series(route(r)), axis=1)
+final["category"] = final["category"].fillna("")
+final["segment_name"] = final["segment_name"].fillna("")
+cols = ["ticket_id", "customer_id", "status", "category", "segment_name", "priority", "route", "tokens_used"]
+final[cols].to_csv("outputs/triage_results.csv", index=False)
+assert len(final) == 164
 
-out_cols = ['ticket_id', 'customer_id', 'status', 'category', 'segment_name', 'priority', 'route', 'tokens_used']
-final_df[out_cols].to_csv('outputs/triage_results.csv', index=False)
-
-print("\nPART C COMPLETE! Wrote outputs/triage_results.csv")
+print(f"triage_results.csv rows: {len(final)}")
+print("status counts:", final["status"].value_counts().to_dict())
+print("route counts:", final["route"].value_counts().to_dict())
+validated = final["status"].isin(["classified_json", "classified_keyword"]).sum()
+print(f"rule-validated (classified_json + classified_keyword): {validated}; sent to human review: {(final['route'] == 'human_review').sum()}")
+print("\nPART C COMPLETE")
